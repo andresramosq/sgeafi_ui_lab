@@ -28,13 +28,11 @@ export function isValidUpcA(code: string): boolean {
   return (10 - (sum % 10)) % 10 === check;
 }
 
-/** Rechaza lecturas basura; valida checksum en EAN/UPC */
+/** Acepta cualquier longitud de código de barras (mínimo 3 caracteres) */
 export function isValidBarcode(code: string): boolean {
-  if (/^\d{13}$/.test(code)) return isValidEan13(code);
-  if (/^\d{8}$/.test(code)) return isValidEan8(code);
-  if (/^\d{12}$/.test(code)) return isValidUpcA(code);
-  if (/^\d{6,}$/.test(code)) return true;
-  if (/^[A-Za-z0-9\-.$/+%]+$/.test(code) && code.length >= 4) return true;
+  if (!code || code.length < 3) return false;
+  if (/^\d+$/.test(code)) return true;
+  if (/^[A-Za-z0-9\-.$/+%]+$/.test(code)) return true;
   return false;
 }
 
@@ -43,16 +41,17 @@ export function normalizeBarcode(raw: string): string | null {
   if (!trimmed) return null;
 
   const digits = digitsOnly(trimmed);
+  const clean = trimmed.replace(/\s/g, "");
 
-  if (digits.length >= 4 && digits.length === trimmed.replace(/\s/g, "").length) {
+  if (digits.length >= 3 && digits.length === clean.length) {
     return digits;
   }
 
-  if (/^[A-Za-z0-9\-.$/+% ]+$/.test(trimmed) && trimmed.length >= 4) {
-    return trimmed.replace(/\s/g, "");
+  if (/^[A-Za-z0-9\-.$/+%]+$/.test(clean) && clean.length >= 3) {
+    return clean;
   }
 
-  if (digits.length >= 4) return digits;
+  if (digits.length >= 3) return digits;
 
   return null;
 }

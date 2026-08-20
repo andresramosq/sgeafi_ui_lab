@@ -60,14 +60,12 @@ function acceptCode(raw: string): string | null {
   return code;
 }
 
-function captureCenterStrip(video: HTMLVideoElement): HTMLCanvasElement {
+function captureFrame(video: HTMLVideoElement): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
-  const h = Math.floor(video.videoHeight * 0.35);
-  const y = Math.floor((video.videoHeight - h) / 2);
   canvas.width = video.videoWidth;
-  canvas.height = h;
+  canvas.height = video.videoHeight;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (ctx) ctx.drawImage(video, 0, y, video.videoWidth, h, 0, 0, video.videoWidth, h);
+  if (ctx) ctx.drawImage(video, 0, 0);
   return canvas;
 }
 
@@ -267,7 +265,7 @@ export default function BarcodeScanner({
         }
       }
 
-      const canvas = captureCenterStrip(video);
+      const canvas = captureFrame(video);
       const result = await Quagga.decodeSingle({
         src: canvas.toDataURL("image/jpeg", 0.95),
         numOfWorkers: 0,
@@ -471,7 +469,7 @@ export default function BarcodeScanner({
                 className={`w-[90%] border-2 border-dashed ${
                   visual === "analyzing" ? "border-green-400" : "border-green-500/60"
                 }`}
-                style={{ height: "35%" }}
+                style={{ height: "60%" }}
               />
             </div>
           </div>
