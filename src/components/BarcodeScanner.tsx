@@ -47,6 +47,33 @@ function stopCamera(
   }
 }
 
+async function startCameraStream(
+  video: HTMLVideoElement
+): Promise<MediaStream> {
+  const attempts: MediaStreamConstraints[] = [
+    { video: { width: { ideal: 1280 }, height: { ideal: 720 } } },
+    { video: true },
+  ];
+
+  let lastError: unknown;
+  for (const constraints of attempts) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      video.setAttribute("playsinline", "true");
+      video.muted = true;
+      await video.play();
+      return stream;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("No se pudo acceder a la cámara");
+}
+
 export default function BarcodeScanner({
   isOpen,
   onClose,
@@ -60,8 +87,9 @@ export default function BarcodeScanner({
   const lastScanRef = useRef({ code: "", time: 0 });
 
   const [error, setError] = useState<string | null>(null);
-  const [isStarting, setIsStarting] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
+  const [status, setStatus] = useState<
+    "idle" | "starting" | "scanning" | "error"
+  >("idle");
   const [manualCode, setManualCode] = useState("");
   const [imageLoading, setImageLoading] = useState(false);
 
@@ -90,40 +118,41 @@ export default function BarcodeScanner({
   };
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setStatus("idle");
+      return;
+    }
 
     let mounted = true;
     const reader = createReader();
     readerRef.current = reader;
 
     const startScanner = async () => {
-      setIsStarting(true);
-      setIsScanning(false);
+      setStatus("starting");
       setError(null);
       setManualCode("");
+
+      // Esperar a que el <video> esté montado en el DOM
+      await new Promise((r) => requestAnimationFrame(r));
 
       const video = videoRef.current;
       if (!video) {
         setError("No se pudo inicializar el visor de cámara");
-        setIsStarting(false);
+        setStatus("error");
         return;
       }
 
       try {
-        const controls = await reader.decodeFromConstraints(
-          {
-            video: {
-              width: { min: 640, ideal: 1920 },
-              height: { min: 480, ideal: 1080 },
-              facingMode: { ideal: "environment" },
-            } as MediaTrackConstraints,
-          },
-          video,
-          (result) => {
-            if (!mounted || !result) return;
-            handleDetectedCode(result.getText());
-          }
-        );
+        const stream = await startCameraStream(video);
+        if (!mounted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        const controls = await reader.decodeFromStream(stream, video, (result) => {
+          if (!mounted || !result) return;
+          handleDetectedCode(result.getText());
+        });
 
         if (!mounted) {
           stopCamera(controls, video);
@@ -131,17 +160,22 @@ export default function BarcodeScanner({
         }
 
         controlsRef.current = controls;
-        setIsScanning(true);
+        setStatus("scanning");
       } catch (err) {
         if (mounted) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : "No se pudo iniciar la cámara. Verifica los permisos del navegador."
-          );
+          const message =
+            err instanceof Error ? err.message : "Error desconocido";
+          if (message.includes("Permission") || message.includes("permiso")) {
+            setError(
+              "Permiso de cámara denegado. Habilita la cámara en la configuración del navegador y recarga la página."
+            );
+          } else if (message.includes("NotFound") || message.includes("not found")) {
+            setError("No se encontró ninguna cámara en este dispositivo.");
+          } else {
+            setError(`No se pudo iniciar la cámara: ${message}`);
+          }
+          setStatus("error");
         }
-      } finally {
-        if (mounted) setIsStarting(false);
       }
     };
 
@@ -149,8 +183,7 @@ export default function BarcodeScanner({
 
     return () => {
       mounted = false;
-      const video = videoRef.current;
-      stopCamera(controlsRef.current, video);
+      stopCamera(controlsRef.current, videoRef.current);
       controlsRef.current = null;
       readerRef.current = null;
     };
@@ -167,19 +200,23 @@ export default function BarcodeScanner({
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !readerRef.current) return;
+    if (!file) return;
+
+    const reader = readerRef.current ?? createReader();
+    readerRef.current = reader;
 
     setImageLoading(true);
     setError(null);
 
     const url = URL.createObjectURL(file);
     try {
-      const result = await readerRef.current.decodeFromImageUrl(url);
+      const result = await reader.decodeFromImageUrl(url);
       handleDetectedCode(result.getText());
     } catch {
       setError(
         "No se detectó código en la imagen. Intenta con mejor luz y el código más grande."
       );
+      setStatus("error");
     } finally {
       URL.revokeObjectURL(url);
       setImageLoading(false);
@@ -214,20 +251,20 @@ export default function BarcodeScanner({
         </div>
 
         <div className="p-5">
-          {isStarting && (
+          {status === "starting" && (
             <div className="mb-4 flex items-center gap-2 text-sm text-slate-600">
               <span className="h-4 w-4 animate-spin rounded-full border-2 border-brand-600 border-t-transparent" />
               Iniciando cámara...
             </div>
           )}
 
-          {isScanning && !error && (
+          {status === "scanning" && !error && (
             <div className="mb-4 flex items-center gap-2 text-sm text-green-700">
               <span className="relative flex h-2 w-2">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-green-500" />
               </span>
-              Escaneando... mueve el código lentamente
+              Cámara activa — mueve el código lentamente
             </div>
           )}
 
@@ -237,24 +274,38 @@ export default function BarcodeScanner({
             </div>
           )}
 
-          <div className="relative overflow-hidden rounded-lg border border-slate-200 bg-black">
+          {/* Visor de cámara */}
+          <div className="relative aspect-video w-full overflow-hidden rounded-lg border border-slate-200 bg-slate-900">
             <video
               ref={videoRef}
-              className="block w-full object-cover"
-              style={{ minHeight: 240, maxHeight: 360 }}
+              className="absolute inset-0 h-full w-full object-cover"
               playsInline
               muted
               autoPlay
             />
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <div className="h-24 w-[85%] rounded border-2 border-green-400 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)]" />
+
+            {/* Overlay: 4 paneles oscuros alrededor del recuadro (sin tapar el video) */}
+            <div className="pointer-events-none absolute inset-0 flex flex-col">
+              <div className="flex-1 bg-black/40" />
+              <div className="flex shrink-0">
+                <div className="w-[7.5%] bg-black/40" />
+                <div className="h-20 w-[85%] rounded border-2 border-green-400 bg-transparent" />
+                <div className="w-[7.5%] bg-black/40" />
+              </div>
+              <div className="flex-1 bg-black/40" />
             </div>
+
+            {status === "starting" && (
+              <div className="absolute inset-0 flex items-center justify-center bg-slate-900/80">
+                <span className="text-sm text-white">Conectando cámara...</span>
+              </div>
+            )}
           </div>
 
           <ul className="mt-3 space-y-1 text-xs text-slate-500">
             <li>• Código en horizontal, dentro del recuadro verde</li>
             <li>• Distancia: 10–20 cm, con buena iluminación</li>
-            <li>• Acerca o aleja lentamente si no detecta</li>
+            <li>• Si ves negro: revisa que el navegador tenga permiso de cámara</li>
           </ul>
 
           <div className="mt-4 flex flex-col gap-3 border-t border-slate-200 pt-4">
