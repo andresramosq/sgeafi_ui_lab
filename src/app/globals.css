@@ -37,18 +37,11 @@
     @apply mb-1 block text-sm font-medium text-slate-700;
   }
 
-  .scanner-live video,
-  .scanner-live canvas {
-    display: block !important;
-    width: 100% !important;
+  .scanner-video {
+    display: block;
+    width: 100%;
     min-height: 280px;
     max-height: 400px;
     object-fit: cover;
-  }
-
-  .scanner-live > div {
-    position: relative;
-    width: 100%;
-    min-height: 280px;
   }
 }
