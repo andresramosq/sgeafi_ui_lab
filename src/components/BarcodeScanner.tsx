@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Html5Qrcode } from "html5-qrcode";
+import {
+  Html5Qrcode,
+  Html5QrcodeSupportedFormats,
+} from "html5-qrcode";
 
 interface BarcodeScannerProps {
   isOpen: boolean;
@@ -9,14 +12,35 @@ interface BarcodeScannerProps {
   onScan: (code: string) => void;
 }
 
+const BARCODE_FORMATS = [
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+  Html5QrcodeSupportedFormats.UPC_A,
+  Html5QrcodeSupportedFormats.UPC_E,
+  Html5QrcodeSupportedFormats.CODE_128,
+  Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.CODE_93,
+  Html5QrcodeSupportedFormats.ITF,
+  Html5QrcodeSupportedFormats.CODABAR,
+  Html5QrcodeSupportedFormats.QR_CODE,
+];
+
 export default function BarcodeScanner({
   isOpen,
   onClose,
   onScan,
 }: BarcodeScannerProps) {
   const scannerRef = useRef<Html5Qrcode | null>(null);
+  const onScanRef = useRef(onScan);
+  const onCloseRef = useRef(onClose);
   const [error, setError] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
+  const [manualCode, setManualCode] = useState("");
+
+  useEffect(() => {
+    onScanRef.current = onScan;
+    onCloseRef.current = onClose;
+  }, [onScan, onClose]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -39,9 +63,15 @@ export default function BarcodeScanner({
     const startScanner = async () => {
       setIsStarting(true);
       setError(null);
+      setManualCode("");
 
       try {
-        const scanner = new Html5Qrcode(scannerId);
+        const scanner = new Html5Qrcode(scannerId, {
+          verbose: false,
+          formatsToSupport: BARCODE_FORMATS,
+          // ZXing suele leer mejor códigos 1D en webcam de PC que BarcodeDetector nativo
+          useBarCodeDetectorIfSupported: false,
+        });
         scannerRef.current = scanner;
 
         const cameras = await Html5Qrcode.getCameras();
@@ -49,24 +79,28 @@ export default function BarcodeScanner({
           throw new Error("No se encontraron cámaras disponibles");
         }
 
-        const rearCamera =
+        const preferredCamera =
           cameras.find((c) => /back|rear|environment/i.test(c.label)) ??
-          cameras[0];
+          cameras[cameras.length - 1];
 
         await scanner.start(
-          rearCamera.id,
+          preferredCamera.id,
           {
-            fps: 10,
-            qrbox: { width: 280, height: 160 },
-            aspectRatio: 1.5,
+            fps: 20,
+            // Sin qrbox: escanea todo el frame (mejor para barras 1D en webcam)
+            disableFlip: true,
+            videoConstraints: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
           },
           (decodedText) => {
-            onScan(decodedText.trim());
+            onScanRef.current(decodedText.trim());
             void stopScanner();
-            onClose();
+            onCloseRef.current();
           },
           () => {
-            // Ignorar errores de escaneo continuo (sin código detectado)
+            // Sin código en este frame; continuar escaneando
           }
         );
       } catch (err) {
@@ -88,7 +122,15 @@ export default function BarcodeScanner({
       mounted = false;
       void stopScanner();
     };
-  }, [isOpen, onClose, onScan]);
+  }, [isOpen]);
+
+  const handleManualSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const code = manualCode.trim();
+    if (!code) return;
+    onScan(code);
+    onClose();
+  };
 
   if (!isOpen) return null;
 
@@ -101,7 +143,7 @@ export default function BarcodeScanner({
               Escanear código de barras
             </h2>
             <p className="text-sm text-slate-500">
-              Apunta la cámara al código de barras o QR del producto
+              Centra el código de barras en la imagen de la cámara
             </p>
           </div>
           <button
@@ -132,12 +174,34 @@ export default function BarcodeScanner({
 
           <div
             id="barcode-scanner-region"
-            className="overflow-hidden rounded-lg border border-slate-200 bg-slate-900"
+            className="overflow-hidden rounded-lg border border-slate-200 bg-slate-900 [&_video]:!object-cover"
           />
 
-          <p className="mt-4 text-center text-xs text-slate-500">
-            Compatible con códigos de barras EAN, UPC, Code 128 y QR
-          </p>
+          <ul className="mt-3 space-y-1 text-xs text-slate-500">
+            <li>• Mantén el código paralelo a la pantalla, a 15–25 cm</li>
+            <li>• Asegúrate de tener buena iluminación</li>
+            <li>• Evita reflejos sobre el plástico del código</li>
+          </ul>
+
+          <form onSubmit={handleManualSubmit} className="mt-5 border-t border-slate-200 pt-4">
+            <label htmlFor="manual-code" className="label">
+              ¿No lee? Ingresa el código manualmente
+            </label>
+            <div className="flex gap-2">
+              <input
+                id="manual-code"
+                type="text"
+                className="input font-mono"
+                placeholder="Ej: 7701234567890"
+                value={manualCode}
+                onChange={(e) => setManualCode(e.target.value)}
+                autoComplete="off"
+              />
+              <button type="submit" className="btn-primary shrink-0" disabled={!manualCode.trim()}>
+                Usar
+              </button>
+            </div>
+          </form>
         </div>
 
         <div className="flex justify-end border-t border-slate-200 px-5 py-4">

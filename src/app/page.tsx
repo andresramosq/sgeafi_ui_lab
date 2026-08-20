@@ -125,7 +125,9 @@ export default function InventoryPage() {
     }
   };
 
-  const handleBarcodeScan = async (code: string) => {
+  const closeScanner = useCallback(() => setScannerOpen(false), []);
+
+  const handleBarcodeScan = useCallback(async (code: string) => {
     try {
       const existing = await fetchProductByCode(code);
 
@@ -151,7 +153,7 @@ export default function InventoryPage() {
     } catch {
       showToast("Error al buscar el código escaneado", "error");
     }
-  };
+  }, [showToast]);
 
   return (
     <div className="min-h-screen">
@@ -257,7 +259,7 @@ export default function InventoryPage() {
 
       <BarcodeScanner
         isOpen={scannerOpen}
-        onClose={() => setScannerOpen(false)}
+        onClose={closeScanner}
         onScan={handleBarcodeScan}
       />
 
