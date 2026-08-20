@@ -2,7 +2,6 @@
 
 import { useCallback, useMemo, useState } from "react";
 import BarcodeScanner from "@/components/BarcodeScanner";
-import { useUsbBarcode } from "@/hooks/useUsbBarcode";
 import ProductFilters, {
   type ProductFiltersState,
 } from "@/components/ProductFilters";
@@ -155,9 +154,6 @@ export default function InventoryPage() {
       showToast("Error al buscar el código escaneado", "error");
     }
   }, [showToast]);
-
-  // Lector USB en toda la página (modo teclado) — funciona sin abrir el modal
-  useUsbBarcode(true, handleBarcodeScan);
 
   return (
     <div className="min-h-screen">
