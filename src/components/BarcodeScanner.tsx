@@ -1,30 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isValidBarcode, normalizeBarcode } from "@/lib/barcode";
+import { isValidEan13, normalizeBarcode } from "@/lib/barcode";
 
-const SCANNER_ID = "quagga-scanner";
 const CONFIRM_TIMEOUT_SEC = 5;
 const MAX_ATTEMPTS = 3;
-const READS_NEEDED = 2;
+const READS_NEEDED = 3;
 
-const QUAGGA_READERS = ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader"];
+const QUAGGA_READERS = ["ean_reader"];
 
-const NATIVE_FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
+const NATIVE_FORMATS = ["ean_13"];
 
-type QuaggaResult = {
-  codeResult?: { code?: string };
-  boxes?: Array<{ x: number; y: number }[]>;
-};
+type QuaggaResult = { codeResult?: { code?: string } };
 
 type QuaggaAPI = {
-  init: (config: Record<string, unknown>, cb: (err: Error | null) => void) => void;
-  start: () => void;
-  stop: () => void;
-  onDetected: (cb: (result: QuaggaResult) => void) => void;
-  offDetected: (cb: (result: QuaggaResult) => void) => void;
-  onProcessed: (cb: (result: QuaggaResult) => void) => void;
-  offProcessed: (cb: (result: QuaggaResult) => void) => void;
+  decodeSingle: (config: Record<string, unknown>) => Promise<QuaggaResult>;
 };
 
 type ScanVisual = "idle" | "analyzing" | "captured";
@@ -48,6 +38,25 @@ function loadQuagga(): Promise<QuaggaAPI> {
   });
 }
 
+/** Solo acepta EAN-13 completo con checksum válido */
+function acceptCode(raw: string): string | null {
+  const code = normalizeBarcode(raw);
+  if (!code || !/^\d{13}$/.test(code)) return null;
+  if (!isValidEan13(code)) return null;
+  return code;
+}
+
+function captureCenterStrip(video: HTMLVideoElement): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  const h = Math.floor(video.videoHeight * 0.35);
+  const y = Math.floor((video.videoHeight - h) / 2);
+  canvas.width = video.videoWidth;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (ctx) ctx.drawImage(video, 0, y, video.videoWidth, h, 0, 0, video.videoWidth, h);
+  return canvas;
+}
+
 interface BarcodeScannerProps {
   isOpen: boolean;
   onClose: () => void;
@@ -59,23 +68,21 @@ export default function BarcodeScanner({
   onClose,
   onScan,
 }: BarcodeScannerProps) {
-  const quaggaRef = useRef<QuaggaAPI | null>(null);
-  const detectedHandlerRef = useRef<(r: QuaggaResult) => void>(() => {});
-  const processedHandlerRef = useRef<(r: QuaggaResult) => void>(() => {});
-  const nativeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const decodeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const phaseRef = useRef<"scanning" | "confirm">("scanning");
   const attemptRef = useRef(0);
+  const busyRef = useRef(false);
   const foundRef = useRef(false);
   const matchCodeRef = useRef<string | null>(null);
   const matchCountRef = useRef(0);
+  const quaggaRef = useRef<QuaggaAPI | null>(null);
   const onScanRef = useRef(onScan);
   const onCloseRef = useRef(onClose);
   const acceptRef = useRef<(raw: string) => void>(() => {});
-  const setVisualRef = useRef<(v: ScanVisual) => void>(() => {});
-  const setCandidateRef = useRef<(c: string | null) => void>(() => {});
-  const setReadsRef = useRef<(n: number) => void>(() => {});
 
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
@@ -94,10 +101,6 @@ export default function BarcodeScanner({
     onCloseRef.current = onClose;
   }, [onScan, onClose]);
 
-  setVisualRef.current = setVisual;
-  setCandidateRef.current = setCandidate;
-  setReadsRef.current = setReads;
-
   const clearTimers = useCallback(() => {
     if (countdownTimerRef.current) {
       clearInterval(countdownTimerRef.current);
@@ -109,46 +112,36 @@ export default function BarcodeScanner({
     }
   }, []);
 
-  const stopNativeLoop = useCallback(() => {
-    if (nativeTimerRef.current) {
-      clearInterval(nativeTimerRef.current);
-      nativeTimerRef.current = null;
+  const stopDecodeLoop = useCallback(() => {
+    if (decodeTimerRef.current) {
+      clearInterval(decodeTimerRef.current);
+      decodeTimerRef.current = null;
     }
   }, []);
 
-  const stopScanner = useCallback(() => {
-    clearTimers();
-    stopNativeLoop();
-    const quagga = quaggaRef.current;
-    if (quagga) {
-      try {
-        quagga.offDetected(detectedHandlerRef.current);
-        quagga.offProcessed(processedHandlerRef.current);
-      } catch {
-        /* noop */
-      }
+  const stopCamera = useCallback(() => {
+    stopDecodeLoop();
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     }
-    quaggaRef.current = null;
-    try {
-      window.Quagga?.stop();
-    } catch {
-      /* noop */
-    }
-    const el = document.getElementById(SCANNER_ID);
-    if (el) el.innerHTML = "";
-    setReady(false);
+    if (videoRef.current) videoRef.current.srcObject = null;
+    matchCodeRef.current = null;
+    matchCountRef.current = 0;
+    busyRef.current = false;
     setVisual("idle");
     setCandidate(null);
     setReads(0);
-    matchCodeRef.current = null;
-    matchCountRef.current = 0;
-  }, [clearTimers, stopNativeLoop]);
+  }, [stopDecodeLoop]);
 
   const stopAll = useCallback(() => {
+    clearTimers();
     phaseRef.current = "scanning";
     attemptRef.current = 0;
-    stopScanner();
-  }, [stopScanner]);
+    quaggaRef.current = null;
+    stopCamera();
+    setReady(false);
+  }, [clearTimers, stopCamera]);
 
   const finalize = useCallback(
     (code: string) => {
@@ -168,22 +161,19 @@ export default function BarcodeScanner({
     setDetectedCode(null);
     setCountdown(CONFIRM_TIMEOUT_SEC);
     setNotify(null);
-    setVisual("idle");
-    setCandidate(null);
-    setReads(0);
     matchCodeRef.current = null;
     matchCountRef.current = 0;
-    startNativeLoopRef.current?.();
+    setCandidate(null);
+    setReads(0);
+    setVisual("idle");
+    startLoopRef.current?.();
   }, []);
 
   const showConfirm = useCallback(
     (code: string) => {
-      stopNativeLoop();
+      stopDecodeLoop();
       setVisual("captured");
-      setNotify(`¡Código capturado! ${code}`);
-      if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-        navigator.vibrate(200);
-      }
+      setNotify(`Código EAN-13 capturado: ${code}`);
 
       const n = attemptRef.current + 1;
       attemptRef.current = n;
@@ -209,14 +199,17 @@ export default function BarcodeScanner({
         else resumeScanning();
       }, CONFIRM_TIMEOUT_SEC * 1000);
     },
-    [clearTimers, finalize, resumeScanning, stopNativeLoop]
+    [clearTimers, finalize, resumeScanning, stopDecodeLoop]
   );
 
   const acceptReading = useCallback(
     (raw: string) => {
       if (foundRef.current || phaseRef.current !== "scanning") return;
-      const code = normalizeBarcode(raw);
-      if (!code || !isValidBarcode(code)) return;
+      const code = acceptCode(raw);
+      if (!code) return;
+
+      setVisual("analyzing");
+      setCandidate(code);
 
       if (matchCodeRef.current === code) {
         matchCountRef.current += 1;
@@ -224,10 +217,7 @@ export default function BarcodeScanner({
         matchCodeRef.current = code;
         matchCountRef.current = 1;
       }
-
-      setCandidateRef.current(code);
-      setReadsRef.current(matchCountRef.current);
-      setVisualRef.current("analyzing");
+      setReads(matchCountRef.current);
 
       if (matchCountRef.current >= READS_NEEDED) {
         showConfirm(code);
@@ -238,37 +228,57 @@ export default function BarcodeScanner({
 
   acceptRef.current = acceptReading;
 
-  const startNativeLoopRef = useRef<(() => void) | null>(null);
+  const decodeFrame = useCallback(async () => {
+    const video = videoRef.current;
+    const Quagga = quaggaRef.current;
+    if (!video || !Quagga || busyRef.current || foundRef.current) return;
+    if (phaseRef.current !== "scanning") return;
+    if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA || !video.videoWidth) return;
 
-  startNativeLoopRef.current = () => {
-    stopNativeLoop();
-    if (!("BarcodeDetector" in window)) return;
-    const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_ID} video`);
-    if (!video) return;
-
+    busyRef.current = true;
     try {
-      const Detector = (
-        window as Window & {
-          BarcodeDetector: new (o: { formats: string[] }) => {
-            detect: (s: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
-          };
+      if ("BarcodeDetector" in window) {
+        const Detector = (
+          window as Window & {
+            BarcodeDetector: new (o: { formats: string[] }) => {
+              detect: (s: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
+            };
+          }
+        ).BarcodeDetector;
+        const detector = new Detector({ formats: NATIVE_FORMATS });
+        const codes = await detector.detect(video);
+        if (codes[0]?.rawValue) {
+          acceptRef.current(codes[0].rawValue);
+          return;
         }
-      ).BarcodeDetector;
-      const detector = new Detector({ formats: NATIVE_FORMATS });
+      }
 
-      nativeTimerRef.current = setInterval(() => {
-        if (phaseRef.current !== "scanning" || foundRef.current) return;
-        if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) return;
-        detector
-          .detect(video)
-          .then((codes) => {
-            if (codes[0]?.rawValue) acceptRef.current(codes[0].rawValue);
-          })
-          .catch(() => {});
-      }, 250);
+      const canvas = captureCenterStrip(video);
+      const result = await Quagga.decodeSingle({
+        src: canvas.toDataURL("image/jpeg", 0.95),
+        numOfWorkers: 0,
+        locate: true,
+        locator: { patchSize: "large", halfSample: false },
+        decoder: { readers: QUAGGA_READERS, multiple: false },
+      });
+
+      if (result.codeResult?.code) {
+        acceptRef.current(result.codeResult.code);
+      }
     } catch {
-      /* noop */
+      /* sin lectura en este frame */
+    } finally {
+      busyRef.current = false;
     }
+  }, []);
+
+  const startLoopRef = useRef<(() => void) | null>(null);
+
+  startLoopRef.current = () => {
+    if (decodeTimerRef.current) return;
+    decodeTimerRef.current = setInterval(() => {
+      void decodeFrame();
+    }, 350);
   };
 
   useEffect(() => {
@@ -294,75 +304,43 @@ export default function BarcodeScanner({
       setNotify(null);
       setVisual("idle");
 
-      await new Promise((r) => setTimeout(r, 150));
-      if (cancelled) return;
-
       try {
         stopAll();
         if (cancelled) return;
 
         const Quagga = await loadQuagga();
+        quaggaRef.current = Quagga;
         if (cancelled) return;
 
-        const target = document.getElementById(SCANNER_ID);
-        if (!target) throw new Error("Contenedor no encontrado");
-
-        await new Promise<void>((resolve, reject) => {
-          Quagga.init(
-            {
-              inputStream: {
-                name: "Live",
-                type: "LiveStream",
-                target,
-                constraints: {
-                  width: { min: 640, ideal: 1280 },
-                  height: { min: 480, ideal: 720 },
-                },
-                area: { top: "25%", right: "8%", left: "8%", bottom: "25%" },
-              },
-              locator: { patchSize: "large", halfSample: false },
-              numOfWorkers: 0,
-              frequency: 10,
-              decoder: { readers: QUAGGA_READERS, multiple: false },
-              locate: true,
-            },
-            (err) => (err ? reject(err) : resolve())
-          );
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            focusMode: { ideal: "continuous" },
+          } as MediaTrackConstraints,
+          audio: false,
         });
-
         if (cancelled) {
-          Quagga.stop();
+          stream.getTracks().forEach((t) => t.stop());
           return;
         }
 
-        quaggaRef.current = Quagga;
+        streamRef.current = stream;
+        const video = videoRef.current;
+        if (!video) throw new Error("Video no disponible");
 
-        const onProcessed = (result: QuaggaResult) => {
-          if (phaseRef.current !== "scanning") return;
-          const hasBox = Boolean(result?.boxes?.length);
-          setVisualRef.current(hasBox ? "analyzing" : "idle");
-        };
-        processedHandlerRef.current = onProcessed;
-        Quagga.onProcessed(onProcessed);
+        video.srcObject = stream;
+        await video.play();
 
-        const onDetected = (result: QuaggaResult) => {
-          if (result.codeResult?.code) acceptRef.current(result.codeResult.code);
-        };
-        detectedHandlerRef.current = onDetected;
-        Quagga.onDetected(onDetected);
-
-        Quagga.start();
-
-        setTimeout(() => {
-          if (!cancelled) startNativeLoopRef.current?.();
-        }, 600);
-
-        if (!cancelled) setReady(true);
+        if (!cancelled) {
+          startLoopRef.current?.();
+          setReady(true);
+        }
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : "Error al abrir cámara");
         }
-        stopScanner();
+        stopAll();
       }
     };
 
@@ -372,14 +350,16 @@ export default function BarcodeScanner({
       cancelled = true;
       stopAll();
     };
-  }, [isOpen, stopAll, stopScanner]);
+  }, [isOpen, stopAll, decodeFrame]);
 
   const borderClass =
     visual === "captured"
-      ? "border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.6)]"
+      ? "border-green-500 shadow-[0_0_24px_rgba(34,197,94,0.7)]"
       : visual === "analyzing"
-        ? "border-green-400 shadow-[0_0_12px_rgba(74,222,128,0.5)]"
-        : "border-slate-300";
+        ? "border-green-400 shadow-[0_0_16px_rgba(74,222,128,0.6)] animate-pulse"
+        : ready
+          ? "border-yellow-400"
+          : "border-slate-300";
 
   return (
     <div
@@ -448,16 +428,14 @@ export default function BarcodeScanner({
               {!ready && !error && (
                 <p className="mb-3 text-sm text-slate-600">Iniciando cámara...</p>
               )}
-              {ready && visual === "idle" && (
-                <p className="mb-3 text-sm text-slate-600">
-                  Apunta al código en horizontal — el borde se pone verde al detectarlo
+              {ready && !candidate && (
+                <p className="mb-3 text-sm text-yellow-700">
+                  Coloca el código EAN-13 en la línea verde del centro
                 </p>
               )}
-              {ready && visual === "analyzing" && (
-                <p className="mb-3 text-sm font-medium text-green-700">
-                  {candidate
-                    ? `Analizando: ${candidate} (${reads}/${READS_NEEDED})`
-                    : "Detectando forma de código..."}
+              {ready && candidate && (
+                <p className="mb-3 text-sm font-semibold text-green-700">
+                  Analizando: {candidate} — lectura {reads}/{READS_NEEDED}
                 </p>
               )}
             </>
@@ -470,11 +448,20 @@ export default function BarcodeScanner({
           )}
 
           <div
-            id={SCANNER_ID}
-            className={`quagga-scanner overflow-hidden rounded-lg border-4 bg-black transition-all duration-200 ${borderClass} ${
+            className={`relative overflow-hidden rounded-lg border-4 bg-black transition-all duration-150 ${borderClass} ${
               phase === "confirm" ? "opacity-50" : ""
             }`}
-          />
+          >
+            <video ref={videoRef} className="scanner-video" playsInline muted />
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <div
+                className={`w-[90%] border-2 border-dashed ${
+                  visual === "analyzing" ? "border-green-400" : "border-green-500/60"
+                }`}
+                style={{ height: "35%" }}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>
