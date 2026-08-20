@@ -37,11 +37,28 @@
     @apply mb-1 block text-sm font-medium text-slate-700;
   }
 
-  .scanner-video {
-    display: block;
+  .quagga-scanner {
+    position: relative;
     width: 100%;
     min-height: 280px;
     max-height: 400px;
+  }
+
+  .quagga-scanner video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    min-height: 280px;
+    max-height: 400px;
     object-fit: cover;
+  }
+
+  .quagga-scanner canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
   }
 }
