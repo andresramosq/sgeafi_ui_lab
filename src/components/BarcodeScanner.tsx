@@ -1,25 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Html5Qrcode, Html5QrcodeSupportedFormats } from "html5-qrcode";
+import { Html5Qrcode } from "html5-qrcode";
+import { captureVideoFrame, decodeBarcodeFromFile } from "@/lib/decodeBarcode";
 import { normalizeBarcode } from "@/lib/barcode";
 
-const SCANNER_DIV = "barcode-live-scanner";
-const CONFIRM_TIMEOUT_SEC = 5;
-const MAX_ATTEMPTS = 3;
-
-const FORMATS = [
-  Html5QrcodeSupportedFormats.EAN_13,
-  Html5QrcodeSupportedFormats.EAN_8,
-  Html5QrcodeSupportedFormats.UPC_A,
-  Html5QrcodeSupportedFormats.UPC_E,
-  Html5QrcodeSupportedFormats.CODE_128,
-  Html5QrcodeSupportedFormats.CODE_39,
-  Html5QrcodeSupportedFormats.CODE_93,
-  Html5QrcodeSupportedFormats.ITF,
-  Html5QrcodeSupportedFormats.CODABAR,
-  Html5QrcodeSupportedFormats.QR_CODE,
-];
+const SCANNER_DIV = "barcode-camera";
 
 interface BarcodeScannerProps {
   isOpen: boolean;
@@ -33,46 +19,23 @@ export default function BarcodeScanner({
   onScan,
 }: BarcodeScannerProps) {
   const cameraRef = useRef<Html5Qrcode | null>(null);
-  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const phaseRef = useRef<"scanning" | "confirm">("scanning");
-  const attemptRef = useRef(0);
-  const foundRef = useRef(false);
   const onScanRef = useRef(onScan);
   const onCloseRef = useRef(onClose);
 
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
-  const [phase, setPhase] = useState<"scanning" | "confirm">("scanning");
+  const [loading, setLoading] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [preview, setPreview] = useState<string | null>(null);
   const [detectedCode, setDetectedCode] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState(0);
-  const [countdown, setCountdown] = useState(CONFIRM_TIMEOUT_SEC);
-  const [isLastAttempt, setIsLastAttempt] = useState(false);
 
   useEffect(() => {
     onScanRef.current = onScan;
     onCloseRef.current = onClose;
   }, [onScan, onClose]);
 
-  const clearTimers = useCallback(() => {
-    if (countdownTimerRef.current) {
-      clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
-    if (autoTimerRef.current) {
-      clearTimeout(autoTimerRef.current);
-      autoTimerRef.current = null;
-    }
-  }, []);
-
   const stopCamera = useCallback(async () => {
-    clearTimers();
-    phaseRef.current = "scanning";
-    attemptRef.current = 0;
-
     const cam = cameraRef.current;
     cameraRef.current = null;
-
     if (cam?.isScanning) {
       try {
         await cam.stop();
@@ -85,217 +48,210 @@ export default function BarcodeScanner({
         }
       }
     }
-  }, [clearTimers]);
+    setCameraReady(false);
+  }, []);
 
-  const finalize = useCallback(
-    async (code: string) => {
-      if (foundRef.current) return;
-      foundRef.current = true;
-      clearTimers();
-      await stopCamera();
-      onScanRef.current(code);
-      onCloseRef.current();
-    },
-    [clearTimers, stopCamera]
-  );
+  const processFile = useCallback(async (file: File) => {
+    setLoading(true);
+    setError(null);
+    setDetectedCode(null);
+    setPreview(URL.createObjectURL(file));
 
-  const showConfirm = useCallback(
-    (code: string) => {
-      const n = attemptRef.current + 1;
-      attemptRef.current = n;
-      const last = n >= MAX_ATTEMPTS;
-
-      phaseRef.current = "confirm";
-      setPhase("confirm");
-      setDetectedCode(code);
-      setAttempt(n);
-      setIsLastAttempt(last);
-      setCountdown(CONFIRM_TIMEOUT_SEC);
-      clearTimers();
-
-      let sec = CONFIRM_TIMEOUT_SEC;
-      countdownTimerRef.current = setInterval(() => {
-        sec -= 1;
-        setCountdown(sec);
-      }, 1000);
-
-      autoTimerRef.current = setTimeout(() => {
-        if (foundRef.current) return;
-        if (last) {
-          void finalize(code);
-        } else {
-          phaseRef.current = "scanning";
-          setPhase("scanning");
-          setDetectedCode(null);
-          setCountdown(CONFIRM_TIMEOUT_SEC);
-        }
-      }, CONFIRM_TIMEOUT_SEC * 1000);
-    },
-    [clearTimers, finalize]
-  );
-
-  const onDetected = useCallback(
-    (raw: string) => {
-      if (foundRef.current || phaseRef.current !== "scanning") return;
+    try {
+      const raw = await decodeBarcodeFromFile(file);
       const code = normalizeBarcode(raw);
-      if (code) showConfirm(code);
-    },
-    [showConfirm]
-  );
+      if (!code) throw new Error("Código leído pero formato no válido");
+      setDetectedCode(code);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se detectó código");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const captureFromCamera = useCallback(async () => {
+    const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_DIV} video`);
+    if (!video?.videoWidth) {
+      setError("La cámara no está lista. Espera un momento.");
+      return;
+    }
+    try {
+      const file = await captureVideoFrame(video);
+      await processFile(file);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Error al capturar");
+    }
+  }, [processFile]);
+
+  const handlePhotoInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) void processFile(file);
+    e.target.value = "";
+  };
+
+  const handleConfirm = async () => {
+    if (!detectedCode) return;
+    await stopCamera();
+    onScanRef.current(detectedCode);
+    onCloseRef.current();
+  };
+
+  const handleRetry = () => {
+    setPreview(null);
+    setDetectedCode(null);
+    setError(null);
+  };
 
   useEffect(() => {
     if (!isOpen) {
       void stopCamera();
-      setReady(false);
-      setPhase("scanning");
+      setPreview(null);
       setDetectedCode(null);
-      foundRef.current = false;
+      setError(null);
       return;
     }
 
-    foundRef.current = false;
-    attemptRef.current = 0;
-    phaseRef.current = "scanning";
     let cancelled = false;
 
-    const start = async () => {
-      setReady(false);
+    const startCamera = async () => {
+      setCameraReady(false);
       setError(null);
-      setPhase("scanning");
-      setDetectedCode(null);
-
-      await new Promise((r) => setTimeout(r, 80));
+      await new Promise((r) => setTimeout(r, 100));
       if (cancelled) return;
 
       try {
         await stopCamera();
-        if (cancelled) return;
-
-        const camera = new Html5Qrcode(SCANNER_DIV, {
-          verbose: false,
-          formatsToSupport: FORMATS,
-          useBarCodeDetectorIfSupported: true,
-        });
+        const camera = new Html5Qrcode(SCANNER_DIV, { verbose: false });
         cameraRef.current = camera;
 
         const cameras = await Html5Qrcode.getCameras();
-        if (!cameras.length) throw new Error("No hay cámara disponible");
+        if (!cameras.length) throw new Error("No hay cámara");
 
-        const cameraId =
+        const id =
           cameras.find((c) => /back|rear|environment/i.test(c.label))?.id ??
           cameras[cameras.length - 1].id;
 
-        await camera.start(
-          cameraId,
-          {
-            fps: 20,
-            // Sin qrbox = escanea todo el video, más rápido y fiable
-            disableFlip: false,
-          },
-          (text) => {
-            if (!cancelled) onDetected(text);
-          },
-          () => {}
-        );
-
-        if (!cancelled) setReady(true);
+        await camera.start(id, { fps: 15, aspectRatio: 1.777778 }, () => {}, () => {});
+        if (!cancelled) setCameraReady(true);
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Error al abrir cámara");
+          setError(err instanceof Error ? err.message : "Error de cámara");
         }
-        await stopCamera();
       }
     };
 
-    void start();
-
+    void startCamera();
     return () => {
       cancelled = true;
       void stopCamera();
     };
-  }, [isOpen, stopCamera, onDetected]);
+  }, [isOpen, stopCamera]);
+
+  useEffect(() => {
+    return () => {
+      if (preview) URL.revokeObjectURL(preview);
+    };
+  }, [preview]);
+
+  if (!isOpen) return null;
 
   return (
-    <div
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 ${
-        isOpen ? "" : "hidden"
-      }`}
-      aria-hidden={!isOpen}
-    >
-      <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="max-h-[95vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-          <h2 className="text-lg font-semibold text-slate-900">Escanear código de barras</h2>
+          <h2 className="text-lg font-semibold">Escanear código de barras</h2>
           <button
             type="button"
             onClick={() => {
               void stopCamera();
               onClose();
             }}
-            className="rounded-lg px-3 py-1 text-slate-500 hover:bg-slate-100"
+            className="text-slate-500 hover:text-slate-800"
           >
-            Cerrar
+            ✕
           </button>
         </div>
 
-        <div className="p-5">
-          {!ready && !error && (
-            <p className="mb-3 text-sm text-slate-600">Iniciando cámara...</p>
-          )}
-          {ready && phase === "scanning" && (
-            <p className="mb-3 text-sm text-green-700">
-              Escaneando — apunta al código de barras
-            </p>
+        <div className="space-y-4 p-5">
+          {/* MÉTODO 1: Tomar foto — el más fiable */}
+          <label className="btn-primary w-full cursor-pointer justify-center py-3 text-base">
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={handlePhotoInput}
+              disabled={loading}
+            />
+            📷 Tomar foto del código de barras
+          </label>
+
+          <p className="text-center text-xs text-slate-500">
+            Recomendado: toma la foto con el código grande y nítido
+          </p>
+
+          <div className="relative text-center text-xs text-slate-400">
+            <span className="bg-white px-2">o usar cámara en vivo</span>
+            <div className="absolute left-0 right-0 top-1/2 -z-10 border-t border-slate-200" />
+          </div>
+
+          {/* Cámara en vivo */}
+          <div
+            id={SCANNER_DIV}
+            className="scanner-live overflow-hidden rounded-lg border-2 border-slate-300 bg-black"
+          />
+
+          {cameraReady && !preview && (
+            <button
+              type="button"
+              onClick={() => void captureFromCamera()}
+              disabled={loading}
+              className="btn-secondary w-full justify-center py-3 text-base"
+            >
+              {loading ? "Analizando..." : "📸 Capturar ahora (congelar frame)"}
+            </button>
           )}
 
-          {phase === "confirm" && detectedCode && (
-            <div className="mb-4 rounded-lg border-2 border-brand-500 bg-brand-50 p-4">
-              <p className="text-sm font-medium text-slate-700">Código detectado</p>
+          {/* Preview + resultado */}
+          {loading && (
+            <p className="text-center text-sm text-slate-600">Analizando imagen...</p>
+          )}
+
+          {preview && (
+            <div className="overflow-hidden rounded-lg border border-slate-200">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={preview} alt="Foto del código" className="w-full object-contain" />
+            </div>
+          )}
+
+          {detectedCode && (
+            <div className="rounded-lg border-2 border-green-500 bg-green-50 p-4">
+              <p className="text-sm font-medium text-green-800">Código detectado</p>
               <p className="mt-1 break-all font-mono text-2xl font-bold text-slate-900">
                 {detectedCode}
               </p>
-              <p className="mt-2 text-sm text-slate-600">
-                {isLastAttempt
-                  ? `Último intento — confirma o se usa en ${countdown}s`
-                  : `Intento ${attempt}/${MAX_ATTEMPTS} — confirma en ${countdown}s`}
-              </p>
-              <div className="mt-4 flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => void finalize(detectedCode)}
-                  className="btn-primary flex-1"
-                >
-                  Confirmar
-                </button>
-                {!isLastAttempt && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      clearTimers();
-                      phaseRef.current = "scanning";
-                      setPhase("scanning");
-                      setDetectedCode(null);
-                    }}
-                    className="btn-secondary"
-                  >
-                    No es este
-                  </button>
-                )}
-              </div>
+              <button
+                type="button"
+                onClick={() => void handleConfirm()}
+                className="btn-primary mt-3 w-full justify-center py-3"
+              >
+                Confirmar y usar este código
+              </button>
             </div>
           )}
 
           {error && (
-            <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
               {error}
-            </p>
+              <button
+                type="button"
+                onClick={handleRetry}
+                className="mt-2 block font-medium underline"
+              >
+                Intentar de nuevo
+              </button>
+            </div>
           )}
-
-          <div
-            id={SCANNER_DIV}
-            className={`scanner-live overflow-hidden rounded-lg border-2 border-slate-300 bg-black ${
-              phase === "confirm" ? "opacity-50" : ""
-            }`}
-          />
         </div>
       </div>
     </div>
