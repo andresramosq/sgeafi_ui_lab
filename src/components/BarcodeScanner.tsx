@@ -1,22 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { normalizeBarcode } from "@/lib/barcode";
+import { isValidBarcode, normalizeBarcode } from "@/lib/barcode";
 
 const SCANNER_ID = "quagga-scanner";
 const CONFIRM_TIMEOUT_SEC = 5;
 const MAX_ATTEMPTS = 3;
+const READS_NEEDED = 2;
 
-const QUAGGA_READERS = [
-  "ean_reader",
-  "ean_8_reader",
-  "upc_reader",
-  "upc_e_reader",
-  "code_128_reader",
-  "code_39_reader",
-];
+const QUAGGA_READERS = ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader"];
 
-type QuaggaResult = { codeResult?: { code?: string } };
+const NATIVE_FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
+
+type QuaggaResult = {
+  codeResult?: { code?: string };
+  boxes?: Array<{ x: number; y: number }[]>;
+};
 
 type QuaggaAPI = {
   init: (config: Record<string, unknown>, cb: (err: Error | null) => void) => void;
@@ -24,7 +23,11 @@ type QuaggaAPI = {
   stop: () => void;
   onDetected: (cb: (result: QuaggaResult) => void) => void;
   offDetected: (cb: (result: QuaggaResult) => void) => void;
+  onProcessed: (cb: (result: QuaggaResult) => void) => void;
+  offProcessed: (cb: (result: QuaggaResult) => void) => void;
 };
+
+type ScanVisual = "idle" | "analyzing" | "captured";
 
 declare global {
   interface Window {
@@ -57,28 +60,43 @@ export default function BarcodeScanner({
   onScan,
 }: BarcodeScannerProps) {
   const quaggaRef = useRef<QuaggaAPI | null>(null);
-  const handlerRef = useRef<(r: QuaggaResult) => void>(() => {});
+  const detectedHandlerRef = useRef<(r: QuaggaResult) => void>(() => {});
+  const processedHandlerRef = useRef<(r: QuaggaResult) => void>(() => {});
+  const nativeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const phaseRef = useRef<"scanning" | "confirm">("scanning");
   const attemptRef = useRef(0);
   const foundRef = useRef(false);
+  const matchCodeRef = useRef<string | null>(null);
+  const matchCountRef = useRef(0);
   const onScanRef = useRef(onScan);
   const onCloseRef = useRef(onClose);
-  const onDetectedRef = useRef<(raw: string) => void>(() => {});
+  const acceptRef = useRef<(raw: string) => void>(() => {});
+  const setVisualRef = useRef<(v: ScanVisual) => void>(() => {});
+  const setCandidateRef = useRef<(c: string | null) => void>(() => {});
+  const setReadsRef = useRef<(n: number) => void>(() => {});
 
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [phase, setPhase] = useState<"scanning" | "confirm">("scanning");
+  const [visual, setVisual] = useState<ScanVisual>("idle");
+  const [candidate, setCandidate] = useState<string | null>(null);
+  const [reads, setReads] = useState(0);
   const [detectedCode, setDetectedCode] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [countdown, setCountdown] = useState(CONFIRM_TIMEOUT_SEC);
   const [isLastAttempt, setIsLastAttempt] = useState(false);
+  const [notify, setNotify] = useState<string | null>(null);
 
   useEffect(() => {
     onScanRef.current = onScan;
     onCloseRef.current = onClose;
   }, [onScan, onClose]);
+
+  setVisualRef.current = setVisual;
+  setCandidateRef.current = setCandidate;
+  setReadsRef.current = setReads;
 
   const clearTimers = useCallback(() => {
     if (countdownTimerRef.current) {
@@ -91,12 +109,21 @@ export default function BarcodeScanner({
     }
   }, []);
 
+  const stopNativeLoop = useCallback(() => {
+    if (nativeTimerRef.current) {
+      clearInterval(nativeTimerRef.current);
+      nativeTimerRef.current = null;
+    }
+  }, []);
+
   const stopScanner = useCallback(() => {
     clearTimers();
+    stopNativeLoop();
     const quagga = quaggaRef.current;
-    if (quagga && handlerRef.current) {
+    if (quagga) {
       try {
-        quagga.offDetected(handlerRef.current);
+        quagga.offDetected(detectedHandlerRef.current);
+        quagga.offProcessed(processedHandlerRef.current);
       } catch {
         /* noop */
       }
@@ -110,7 +137,12 @@ export default function BarcodeScanner({
     const el = document.getElementById(SCANNER_ID);
     if (el) el.innerHTML = "";
     setReady(false);
-  }, [clearTimers]);
+    setVisual("idle");
+    setCandidate(null);
+    setReads(0);
+    matchCodeRef.current = null;
+    matchCountRef.current = 0;
+  }, [clearTimers, stopNativeLoop]);
 
   const stopAll = useCallback(() => {
     phaseRef.current = "scanning";
@@ -135,10 +167,24 @@ export default function BarcodeScanner({
     setPhase("scanning");
     setDetectedCode(null);
     setCountdown(CONFIRM_TIMEOUT_SEC);
+    setNotify(null);
+    setVisual("idle");
+    setCandidate(null);
+    setReads(0);
+    matchCodeRef.current = null;
+    matchCountRef.current = 0;
+    startNativeLoopRef.current?.();
   }, []);
 
   const showConfirm = useCallback(
     (code: string) => {
+      stopNativeLoop();
+      setVisual("captured");
+      setNotify(`¡Código capturado! ${code}`);
+      if (typeof navigator !== "undefined" && "vibrate" in navigator) {
+        navigator.vibrate(200);
+      }
+
       const n = attemptRef.current + 1;
       attemptRef.current = n;
       const last = n >= MAX_ATTEMPTS;
@@ -163,25 +209,74 @@ export default function BarcodeScanner({
         else resumeScanning();
       }, CONFIRM_TIMEOUT_SEC * 1000);
     },
-    [clearTimers, finalize, resumeScanning]
+    [clearTimers, finalize, resumeScanning, stopNativeLoop]
   );
 
-  const onDetected = useCallback(
+  const acceptReading = useCallback(
     (raw: string) => {
       if (foundRef.current || phaseRef.current !== "scanning") return;
       const code = normalizeBarcode(raw);
-      if (code) showConfirm(code);
+      if (!code || !isValidBarcode(code)) return;
+
+      if (matchCodeRef.current === code) {
+        matchCountRef.current += 1;
+      } else {
+        matchCodeRef.current = code;
+        matchCountRef.current = 1;
+      }
+
+      setCandidateRef.current(code);
+      setReadsRef.current(matchCountRef.current);
+      setVisualRef.current("analyzing");
+
+      if (matchCountRef.current >= READS_NEEDED) {
+        showConfirm(code);
+      }
     },
     [showConfirm]
   );
 
-  onDetectedRef.current = onDetected;
+  acceptRef.current = acceptReading;
+
+  const startNativeLoopRef = useRef<(() => void) | null>(null);
+
+  startNativeLoopRef.current = () => {
+    stopNativeLoop();
+    if (!("BarcodeDetector" in window)) return;
+    const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_ID} video`);
+    if (!video) return;
+
+    try {
+      const Detector = (
+        window as Window & {
+          BarcodeDetector: new (o: { formats: string[] }) => {
+            detect: (s: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
+          };
+        }
+      ).BarcodeDetector;
+      const detector = new Detector({ formats: NATIVE_FORMATS });
+
+      nativeTimerRef.current = setInterval(() => {
+        if (phaseRef.current !== "scanning" || foundRef.current) return;
+        if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) return;
+        detector
+          .detect(video)
+          .then((codes) => {
+            if (codes[0]?.rawValue) acceptRef.current(codes[0].rawValue);
+          })
+          .catch(() => {});
+      }, 250);
+    } catch {
+      /* noop */
+    }
+  };
 
   useEffect(() => {
     if (!isOpen) {
       stopAll();
       setPhase("scanning");
       setDetectedCode(null);
+      setNotify(null);
       foundRef.current = false;
       return;
     }
@@ -196,6 +291,8 @@ export default function BarcodeScanner({
       setError(null);
       setPhase("scanning");
       setDetectedCode(null);
+      setNotify(null);
+      setVisual("idle");
 
       await new Promise((r) => setTimeout(r, 150));
       if (cancelled) return;
@@ -220,10 +317,10 @@ export default function BarcodeScanner({
                 constraints: {
                   width: { min: 640, ideal: 1280 },
                   height: { min: 480, ideal: 720 },
-                  facingMode: "environment",
                 },
+                area: { top: "25%", right: "8%", left: "8%", bottom: "25%" },
               },
-              locator: { patchSize: "medium", halfSample: true },
+              locator: { patchSize: "large", halfSample: false },
               numOfWorkers: 0,
               frequency: 10,
               decoder: { readers: QUAGGA_READERS, multiple: false },
@@ -239,14 +336,26 @@ export default function BarcodeScanner({
         }
 
         quaggaRef.current = Quagga;
-        const handler = (result: QuaggaResult) => {
-          if (result.codeResult?.code) {
-            onDetectedRef.current(result.codeResult.code);
-          }
+
+        const onProcessed = (result: QuaggaResult) => {
+          if (phaseRef.current !== "scanning") return;
+          const hasBox = Boolean(result?.boxes?.length);
+          setVisualRef.current(hasBox ? "analyzing" : "idle");
         };
-        handlerRef.current = handler;
-        Quagga.onDetected(handler);
+        processedHandlerRef.current = onProcessed;
+        Quagga.onProcessed(onProcessed);
+
+        const onDetected = (result: QuaggaResult) => {
+          if (result.codeResult?.code) acceptRef.current(result.codeResult.code);
+        };
+        detectedHandlerRef.current = onDetected;
+        Quagga.onDetected(onDetected);
+
         Quagga.start();
+
+        setTimeout(() => {
+          if (!cancelled) startNativeLoopRef.current?.();
+        }, 600);
 
         if (!cancelled) setReady(true);
       } catch (err) {
@@ -264,6 +373,13 @@ export default function BarcodeScanner({
       stopAll();
     };
   }, [isOpen, stopAll, stopScanner]);
+
+  const borderClass =
+    visual === "captured"
+      ? "border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.6)]"
+      : visual === "analyzing"
+        ? "border-green-400 shadow-[0_0_12px_rgba(74,222,128,0.5)]"
+        : "border-slate-300";
 
   return (
     <div
@@ -288,6 +404,12 @@ export default function BarcodeScanner({
         </div>
 
         <div className="p-5">
+          {notify && (
+            <div className="mb-3 rounded-lg border border-green-400 bg-green-100 px-3 py-2 text-sm font-medium text-green-800">
+              {notify}
+            </div>
+          )}
+
           {phase === "confirm" && detectedCode ? (
             <div className="mb-4 rounded-lg border-2 border-brand-500 bg-brand-50 p-4">
               <p className="text-sm font-medium text-slate-700">Código detectado</p>
@@ -326,9 +448,16 @@ export default function BarcodeScanner({
               {!ready && !error && (
                 <p className="mb-3 text-sm text-slate-600">Iniciando cámara...</p>
               )}
-              {ready && (
-                <p className="mb-3 text-sm text-green-700">
-                  Apunta al código en horizontal — buena luz
+              {ready && visual === "idle" && (
+                <p className="mb-3 text-sm text-slate-600">
+                  Apunta al código en horizontal — el borde se pone verde al detectarlo
+                </p>
+              )}
+              {ready && visual === "analyzing" && (
+                <p className="mb-3 text-sm font-medium text-green-700">
+                  {candidate
+                    ? `Analizando: ${candidate} (${reads}/${READS_NEEDED})`
+                    : "Detectando forma de código..."}
                 </p>
               )}
             </>
@@ -342,7 +471,7 @@ export default function BarcodeScanner({
 
           <div
             id={SCANNER_ID}
-            className={`quagga-scanner overflow-hidden rounded-lg border-2 border-slate-300 bg-black ${
+            className={`quagga-scanner overflow-hidden rounded-lg border-4 bg-black transition-all duration-200 ${borderClass} ${
               phase === "confirm" ? "opacity-50" : ""
             }`}
           />
