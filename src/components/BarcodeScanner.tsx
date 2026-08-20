@@ -1,15 +1,31 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isValidEan13, normalizeBarcode } from "@/lib/barcode";
+import { isValidBarcode, normalizeBarcode } from "@/lib/barcode";
 
 const CONFIRM_TIMEOUT_SEC = 5;
 const MAX_ATTEMPTS = 3;
-const READS_NEEDED = 3;
+const READS_NEEDED = 2;
 
-const QUAGGA_READERS = ["ean_reader"];
+const QUAGGA_READERS = [
+  "ean_reader",
+  "ean_8_reader",
+  "upc_reader",
+  "upc_e_reader",
+  "code_128_reader",
+  "code_39_reader",
+];
 
-const NATIVE_FORMATS = ["ean_13"];
+const NATIVE_FORMATS = [
+  "ean_13",
+  "ean_8",
+  "upc_a",
+  "upc_e",
+  "code_128",
+  "code_39",
+  "codabar",
+  "itf",
+];
 
 type QuaggaResult = { codeResult?: { code?: string } };
 
@@ -38,11 +54,9 @@ function loadQuagga(): Promise<QuaggaAPI> {
   });
 }
 
-/** Solo acepta EAN-13 completo con checksum válido */
 function acceptCode(raw: string): string | null {
   const code = normalizeBarcode(raw);
-  if (!code || !/^\d{13}$/.test(code)) return null;
-  if (!isValidEan13(code)) return null;
+  if (!code || !isValidBarcode(code)) return null;
   return code;
 }
 
@@ -173,7 +187,7 @@ export default function BarcodeScanner({
     (code: string) => {
       stopDecodeLoop();
       setVisual("captured");
-      setNotify(`Código EAN-13 capturado: ${code}`);
+      setNotify(`Código capturado: ${code}`);
 
       const n = attemptRef.current + 1;
       attemptRef.current = n;
@@ -316,8 +330,7 @@ export default function BarcodeScanner({
           video: {
             width: { ideal: 1920 },
             height: { ideal: 1080 },
-            focusMode: { ideal: "continuous" },
-          } as MediaTrackConstraints,
+          },
           audio: false,
         });
         if (cancelled) {
@@ -430,7 +443,7 @@ export default function BarcodeScanner({
               )}
               {ready && !candidate && (
                 <p className="mb-3 text-sm text-yellow-700">
-                  Coloca el código EAN-13 en la línea verde del centro
+                  Coloca el código de barras en la línea verde del centro
                 </p>
               )}
               {ready && candidate && (

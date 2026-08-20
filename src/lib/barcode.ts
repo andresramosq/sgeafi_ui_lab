@@ -44,13 +44,15 @@ export function normalizeBarcode(raw: string): string | null {
 
   const digits = digitsOnly(trimmed);
 
-  if (digits.length >= 6 && digits.length === trimmed.replace(/\s/g, "").length) {
+  if (digits.length >= 4 && digits.length === trimmed.replace(/\s/g, "").length) {
     return digits;
   }
 
-  if (/^[A-Za-z0-9\-.$/+%]+$/.test(trimmed.replace(/\s/g, "")) && trimmed.length >= 4) {
+  if (/^[A-Za-z0-9\-.$/+% ]+$/.test(trimmed) && trimmed.length >= 4) {
     return trimmed.replace(/\s/g, "");
   }
+
+  if (digits.length >= 4) return digits;
 
   return null;
 }
