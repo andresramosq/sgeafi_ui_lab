@@ -105,7 +105,6 @@ export default function BarcodeScanner({
   const [detectedCode, setDetectedCode] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [countdown, setCountdown] = useState(CONFIRM_TIMEOUT_SEC);
-  const [isLastAttempt, setIsLastAttempt] = useState(false);
   const [notify, setNotify] = useState<string | null>(null);
 
   useEffect(() => {
@@ -189,13 +188,11 @@ export default function BarcodeScanner({
 
       const n = attemptRef.current + 1;
       attemptRef.current = n;
-      const last = n >= MAX_ATTEMPTS;
 
       phaseRef.current = "confirm";
       setPhase("confirm");
       setDetectedCode(code);
       setAttempt(n);
-      setIsLastAttempt(last);
       setCountdown(CONFIRM_TIMEOUT_SEC);
       clearTimers();
 
@@ -207,8 +204,8 @@ export default function BarcodeScanner({
 
       autoTimerRef.current = setTimeout(() => {
         if (foundRef.current) return;
-        if (last) finalize(code);
-        else resumeScanning();
+        clearTimers();
+        resumeScanning();
       }, CONFIRM_TIMEOUT_SEC * 1000);
     },
     [clearTimers, finalize, resumeScanning, stopDecodeLoop]
@@ -408,9 +405,7 @@ export default function BarcodeScanner({
                 {detectedCode}
               </p>
               <p className="mt-2 text-sm text-slate-600">
-                {isLastAttempt
-                  ? `Último intento — confirma o se usará en ${countdown}s`
-                  : `Intento ${attempt}/${MAX_ATTEMPTS} — confirma en ${countdown}s`}
+                Intento {attempt}/{MAX_ATTEMPTS} — pulsa Confirmar o No es este ({countdown}s)
               </p>
               <div className="mt-4 flex gap-2">
                 <button
@@ -420,18 +415,16 @@ export default function BarcodeScanner({
                 >
                   Confirmar
                 </button>
-                {!isLastAttempt && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      clearTimers();
-                      resumeScanning();
-                    }}
-                    className="btn-secondary"
-                  >
-                    No es este
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearTimers();
+                    resumeScanning();
+                  }}
+                  className="btn-secondary"
+                >
+                  No es este
+                </button>
               </div>
             </div>
           ) : (
