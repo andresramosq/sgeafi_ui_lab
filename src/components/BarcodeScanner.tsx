@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useUsbBarcode } from "@/hooks/useUsbBarcode";
 import { normalizeBarcode } from "@/lib/barcode";
 
 const SCANNER_DIV = "barcode-live-scanner";
@@ -14,17 +15,6 @@ const QUAGGA_READERS = [
   "upc_e_reader",
   "code_128_reader",
   "code_39_reader",
-];
-
-const NATIVE_FORMATS = [
-  "ean_13",
-  "ean_8",
-  "upc_a",
-  "upc_e",
-  "code_128",
-  "code_39",
-  "codabar",
-  "itf",
 ];
 
 type QuaggaResult = { codeResult?: { code?: string } };
@@ -56,9 +46,6 @@ function loadQuaggaScript(): Promise<QuaggaAPI> {
         if (window.Quagga) resolve(window.Quagga);
         else reject(new Error("Quagga no disponible"));
       });
-      existing.addEventListener("error", () =>
-        reject(new Error("Error cargando motor de barras"))
-      );
       return;
     }
 
@@ -75,15 +62,20 @@ function loadQuaggaScript(): Promise<QuaggaAPI> {
   });
 }
 
-async function pickCameraId(): Promise<string | undefined> {
-  if (!navigator.mediaDevices?.enumerateDevices) return undefined;
+async function requestCamera(): Promise<MediaTrackConstraints> {
+  await navigator.mediaDevices.getUserMedia({ video: true });
   const devices = await navigator.mediaDevices.enumerateDevices();
   const cameras = devices.filter((d) => d.kind === "videoinput");
-  if (!cameras.length) return undefined;
-  return (
-    cameras.find((c) => /back|rear|environment/i.test(c.label))?.deviceId ??
-    cameras[cameras.length - 1].deviceId
-  );
+  const preferred =
+    cameras.find((c) => /back|rear|environment/i.test(c.label)) ??
+    cameras[cameras.length - 1];
+
+  return {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    ...(preferred?.deviceId ? { deviceId: preferred.deviceId } : {}),
+    facingMode: preferred ? undefined : "environment",
+  };
 }
 
 interface BarcodeScannerProps {
@@ -97,8 +89,8 @@ export default function BarcodeScanner({
   onClose,
   onScan,
 }: BarcodeScannerProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
   const quaggaRef = useRef<QuaggaAPI | null>(null);
-  const nativeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const phaseRef = useRef<"scanning" | "confirm">("scanning");
@@ -106,11 +98,12 @@ export default function BarcodeScanner({
   const foundRef = useRef(false);
   const onScanRef = useRef(onScan);
   const onCloseRef = useRef(onClose);
-  const onDetectedRef = useRef<(raw: string) => void>(() => {});
   const quaggaHandlerRef = useRef<(result: QuaggaResult) => void>(() => {});
 
+  const [manualCode, setManualCode] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
   const [phase, setPhase] = useState<"scanning" | "confirm">("scanning");
   const [detectedCode, setDetectedCode] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -133,19 +126,7 @@ export default function BarcodeScanner({
     }
   }, []);
 
-  const stopNativeLoop = useCallback(() => {
-    if (nativeTimerRef.current) {
-      clearInterval(nativeTimerRef.current);
-      nativeTimerRef.current = null;
-    }
-  }, []);
-
-  const stopScanner = useCallback(() => {
-    clearTimers();
-    stopNativeLoop();
-    phaseRef.current = "scanning";
-    attemptRef.current = 0;
-
+  const stopCamera = useCallback(() => {
     const quagga = quaggaRef.current;
     if (quagga && quaggaHandlerRef.current) {
       try {
@@ -164,18 +145,26 @@ export default function BarcodeScanner({
 
     const container = document.getElementById(SCANNER_DIV);
     if (container) container.innerHTML = "";
-  }, [clearTimers, stopNativeLoop]);
+    setCameraReady(false);
+  }, []);
+
+  const stopAll = useCallback(() => {
+    clearTimers();
+    phaseRef.current = "scanning";
+    attemptRef.current = 0;
+    stopCamera();
+  }, [clearTimers, stopCamera]);
 
   const finalize = useCallback(
     (code: string) => {
       if (foundRef.current) return;
       foundRef.current = true;
       clearTimers();
-      stopScanner();
+      stopAll();
       onScanRef.current(code);
       onCloseRef.current();
     },
-    [clearTimers, stopScanner]
+    [clearTimers, stopAll]
   );
 
   const resumeScanning = useCallback(() => {
@@ -183,13 +172,11 @@ export default function BarcodeScanner({
     setPhase("scanning");
     setDetectedCode(null);
     setCountdown(CONFIRM_TIMEOUT_SEC);
-    startNativeLoopRef.current?.();
+    setTimeout(() => inputRef.current?.focus(), 50);
   }, []);
 
   const showConfirm = useCallback(
     (code: string) => {
-      stopNativeLoop();
-
       const n = attemptRef.current + 1;
       attemptRef.current = n;
       const last = n >= MAX_ATTEMPTS;
@@ -210,17 +197,14 @@ export default function BarcodeScanner({
 
       autoTimerRef.current = setTimeout(() => {
         if (foundRef.current) return;
-        if (last) {
-          finalize(code);
-        } else {
-          resumeScanning();
-        }
+        if (last) finalize(code);
+        else resumeScanning();
       }, CONFIRM_TIMEOUT_SEC * 1000);
     },
-    [clearTimers, finalize, resumeScanning, stopNativeLoop]
+    [clearTimers, finalize, resumeScanning]
   );
 
-  const onDetected = useCallback(
+  const handleRawCode = useCallback(
     (raw: string) => {
       if (foundRef.current || phaseRef.current !== "scanning") return;
       const code = normalizeBarcode(raw);
@@ -229,48 +213,26 @@ export default function BarcodeScanner({
     [showConfirm]
   );
 
-  onDetectedRef.current = onDetected;
+  useUsbBarcode(isOpen && phase === "scanning", handleRawCode);
 
-  const startNativeLoopRef = useRef<(() => void) | null>(null);
-
-  startNativeLoopRef.current = () => {
-    stopNativeLoop();
-    if (typeof window === "undefined" || !("BarcodeDetector" in window)) return;
-
-    const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_DIV} video`);
-    if (!video) return;
-
-    try {
-      const Detector = (
-        window as Window & {
-          BarcodeDetector: new (o: { formats: string[] }) => {
-            detect: (s: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
-          };
-        }
-      ).BarcodeDetector;
-      const detector = new Detector({ formats: NATIVE_FORMATS });
-
-      nativeTimerRef.current = setInterval(() => {
-        if (phaseRef.current !== "scanning" || foundRef.current) return;
-        if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) return;
-        detector
-          .detect(video)
-          .then((codes) => {
-            if (codes[0]?.rawValue) onDetectedRef.current(codes[0].rawValue);
-          })
-          .catch(() => {});
-      }, 200);
-    } catch {
-      /* BarcodeDetector no disponible */
+  const submitManual = () => {
+    const code = normalizeBarcode(manualCode);
+    if (!code) {
+      setError("Código inválido");
+      return;
     }
+    setError(null);
+    handleRawCode(code);
   };
 
   useEffect(() => {
     if (!isOpen) {
-      stopScanner();
-      setReady(false);
+      stopAll();
       setPhase("scanning");
       setDetectedCode(null);
+      setManualCode("");
+      setError(null);
+      setCameraError(null);
       foundRef.current = false;
       return;
     }
@@ -280,28 +242,23 @@ export default function BarcodeScanner({
     phaseRef.current = "scanning";
     let cancelled = false;
 
-    const start = async () => {
-      setReady(false);
-      setError(null);
-      setPhase("scanning");
-      setDetectedCode(null);
+    setTimeout(() => inputRef.current?.focus(), 100);
 
-      await new Promise((r) => setTimeout(r, 100));
-      if (cancelled) return;
+    const startCamera = async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setCameraError("Este navegador no soporta cámara");
+        return;
+      }
 
       try {
-        stopScanner();
-        if (cancelled) return;
-
         const Quagga = await loadQuaggaScript();
         if (cancelled) return;
 
-        const cameraId = await pickCameraId();
-        const constraints: MediaTrackConstraints = {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        };
-        if (cameraId) constraints.deviceId = { exact: cameraId };
+        const constraints = await requestCamera();
+        if (cancelled) return;
+
+        const target = document.getElementById(SCANNER_DIV);
+        if (!target) return;
 
         await new Promise<void>((resolve, reject) => {
           Quagga.init(
@@ -309,25 +266,17 @@ export default function BarcodeScanner({
               inputStream: {
                 name: "Live",
                 type: "LiveStream",
-                target: document.querySelector(`#${SCANNER_DIV}`),
+                target,
                 constraints,
+                area: { top: "30%", right: "5%", left: "5%", bottom: "30%" },
               },
-              locator: {
-                patchSize: "medium",
-                halfSample: true,
-              },
+              locator: { patchSize: "large", halfSample: false },
               numOfWorkers: 0,
               frequency: 10,
-              decoder: {
-                readers: QUAGGA_READERS,
-                multiple: false,
-              },
+              decoder: { readers: QUAGGA_READERS, multiple: false },
               locate: true,
             },
-            (err) => {
-              if (err) reject(err);
-              else resolve();
-            }
+            (err) => (err ? reject(err) : resolve())
           );
         });
 
@@ -337,39 +286,30 @@ export default function BarcodeScanner({
         }
 
         quaggaRef.current = Quagga;
-
         const handler = (result: QuaggaResult) => {
-          if (result.codeResult?.code) {
-            onDetectedRef.current(result.codeResult.code);
-          }
+          if (result.codeResult?.code) handleRawCode(result.codeResult.code);
         };
         quaggaHandlerRef.current = handler;
         Quagga.onDetected(handler);
         Quagga.start();
-
-        // BarcodeDetector nativo en paralelo (Chrome/Edge)
-        setTimeout(() => {
-          if (!cancelled) startNativeLoopRef.current?.();
-        }, 500);
-
-        if (!cancelled) setReady(true);
+        if (!cancelled) setCameraReady(true);
       } catch (err) {
         if (!cancelled) {
-          setError(
-            err instanceof Error ? err.message : "Error al abrir la cámara"
+          setCameraError(
+            err instanceof Error ? err.message : "Cámara no disponible"
           );
         }
-        stopScanner();
+        stopCamera();
       }
     };
 
-    void start();
+    void startCamera();
 
     return () => {
       cancelled = true;
-      stopScanner();
+      stopAll();
     };
-  }, [isOpen, stopScanner]);
+  }, [isOpen, stopAll, stopCamera, handleRawCode]);
 
   return (
     <div
@@ -381,12 +321,12 @@ export default function BarcodeScanner({
       <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
           <h2 className="text-lg font-semibold text-slate-900">
-            Escanear código de barras
+            Escanear código
           </h2>
           <button
             type="button"
             onClick={() => {
-              stopScanner();
+              stopAll();
               onClose();
             }}
             className="rounded-lg px-3 py-1 text-slate-500 hover:bg-slate-100"
@@ -395,18 +335,45 @@ export default function BarcodeScanner({
           </button>
         </div>
 
-        <div className="p-5">
-          {!ready && !error && (
-            <p className="mb-3 text-sm text-slate-600">Iniciando cámara...</p>
-          )}
-          {ready && phase === "scanning" && (
-            <p className="mb-3 text-sm text-green-700">
-              Apunta el código en horizontal — buena luz, a 15–25 cm
-            </p>
+        <div className="space-y-4 p-5">
+          {phase === "scanning" && (
+            <div>
+              <label htmlFor="barcode-input" className="label">
+                Lector USB o escribir código
+              </label>
+              <div className="flex gap-2">
+                <input
+                  ref={inputRef}
+                  id="barcode-input"
+                  type="text"
+                  className="input font-mono"
+                  value={manualCode}
+                  onChange={(e) => {
+                    setManualCode(e.target.value);
+                    setError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      submitManual();
+                    }
+                  }}
+                  placeholder="Escanea aquí o escribe y Enter"
+                  autoComplete="off"
+                  autoFocus
+                />
+                <button type="button" onClick={submitManual} className="btn-primary shrink-0">
+                  OK
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-slate-500">
+                Con lector USB: apunta y escanea — no hace falta hacer clic.
+              </p>
+            </div>
           )}
 
           {phase === "confirm" && detectedCode && (
-            <div className="mb-4 rounded-lg border-2 border-brand-500 bg-brand-50 p-4">
+            <div className="rounded-lg border-2 border-brand-500 bg-brand-50 p-4">
               <p className="text-sm font-medium text-slate-700">Código detectado</p>
               <p className="mt-1 break-all font-mono text-2xl font-bold text-slate-900">
                 {detectedCode}
@@ -441,17 +408,33 @@ export default function BarcodeScanner({
           )}
 
           {error && (
-            <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
               {error}
             </p>
           )}
 
-          <div
-            id={SCANNER_DIV}
-            className={`scanner-live overflow-hidden rounded-lg border-2 border-slate-300 bg-black ${
-              phase === "confirm" ? "opacity-50" : ""
-            }`}
-          />
+          {phase === "scanning" && (
+            <div>
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                Cámara (opcional)
+              </p>
+              {cameraError && (
+                <p className="mb-2 text-sm text-amber-700">{cameraError}</p>
+              )}
+              {!cameraReady && !cameraError && (
+                <p className="mb-2 text-sm text-slate-500">Iniciando cámara...</p>
+              )}
+              {cameraReady && (
+                <p className="mb-2 text-sm text-slate-600">
+                  Código en horizontal, buena luz, 15–25 cm
+                </p>
+              )}
+              <div
+                id={SCANNER_DIV}
+                className="scanner-live overflow-hidden rounded-lg border border-slate-200 bg-black"
+              />
+            </div>
+          )}
         </div>
       </div>
     </div>
