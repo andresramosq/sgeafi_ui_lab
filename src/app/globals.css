@@ -37,8 +37,9 @@
     @apply mb-1 block text-sm font-medium text-slate-700;
   }
 
-  .scanner-container video {
-    display: block !important;
+  .scanner-viewport video,
+  .scanner-viewport canvas {
+    display: block;
     width: 100% !important;
     max-height: 360px;
     object-fit: cover;
