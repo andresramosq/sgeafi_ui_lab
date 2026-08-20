@@ -1,48 +1,67 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BrowserMultiFormatOneDReader } from "@zxing/browser";
-import { BarcodeFormat, DecodeHintType } from "@zxing/library";
+import { Html5Qrcode, Html5QrcodeSupportedFormats } from "html5-qrcode";
 
-const DETECTOR_FORMATS = [
-  "ean_13",
-  "ean_8",
-  "upc_a",
-  "upc_e",
-  "code_128",
-  "code_39",
-  "codabar",
-  "itf",
+const SCANNER_DIV = "barcode-live-scanner";
+
+const HTML5_FORMATS = [
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+  Html5QrcodeSupportedFormats.UPC_A,
+  Html5QrcodeSupportedFormats.UPC_E,
+  Html5QrcodeSupportedFormats.CODE_128,
+  Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.CODE_93,
+  Html5QrcodeSupportedFormats.ITF,
+  Html5QrcodeSupportedFormats.CODABAR,
 ];
 
-function createZxingReader() {
-  const hints = new Map<DecodeHintType, unknown>();
-  hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-    BarcodeFormat.EAN_13,
-    BarcodeFormat.EAN_8,
-    BarcodeFormat.UPC_A,
-    BarcodeFormat.UPC_E,
-    BarcodeFormat.CODE_128,
-    BarcodeFormat.CODE_39,
-    BarcodeFormat.ITF,
-    BarcodeFormat.CODABAR,
-  ]);
-  hints.set(DecodeHintType.TRY_HARDER, true);
-  return new BrowserMultiFormatOneDReader(hints);
-}
+const QUAGGA_READERS = [
+  "ean_reader",
+  "ean_8_reader",
+  "upc_reader",
+  "upc_e_reader",
+  "code_128_reader",
+  "code_39_reader",
+];
 
-type NativeDetector = {
-  detect: (source: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
+type QuaggaResult = { codeResult?: { code?: string } };
+
+type QuaggaAPI = {
+  decodeSingle: (
+    config: Record<string, unknown>,
+    cb?: (r: QuaggaResult) => void
+  ) => Promise<QuaggaResult>;
 };
 
-function getNativeDetector(): NativeDetector | null {
-  if (typeof window === "undefined" || !("BarcodeDetector" in window)) return null;
-  try {
-    const Detector = (window as Window & { BarcodeDetector: new (o: { formats: string[] }) => NativeDetector }).BarcodeDetector;
-    return new Detector({ formats: DETECTOR_FORMATS });
-  } catch {
-    return null;
+declare global {
+  interface Window {
+    Quagga?: QuaggaAPI;
   }
+}
+
+function loadQuaggaScript(): Promise<QuaggaAPI> {
+  if (window.Quagga) return Promise.resolve(window.Quagga);
+
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector('script[data-quagga="1"]');
+    if (existing) {
+      existing.addEventListener("load", () => resolve(window.Quagga!));
+      existing.addEventListener("error", () => reject(new Error("Quagga no cargó")));
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "/quagga.min.js";
+    script.async = true;
+    script.dataset.quagga = "1";
+    script.onload = () => {
+      if (window.Quagga) resolve(window.Quagga);
+      else reject(new Error("Quagga no disponible"));
+    };
+    script.onerror = () => reject(new Error("Error cargando motor de barras"));
+    document.head.appendChild(script);
+  });
 }
 
 interface BarcodeScannerProps {
@@ -56,114 +75,113 @@ export default function BarcodeScanner({
   onClose,
   onScan,
 }: BarcodeScannerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const busyRef = useRef(false);
+  const cameraRef = useRef<Html5Qrcode | null>(null);
+  const decodeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const foundRef = useRef(false);
+  const busyRef = useRef(false);
   const onScanRef = useRef(onScan);
   const onCloseRef = useRef(onClose);
 
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState<"idle" | "starting" | "scanning" | "error">("idle");
-  const [manualCode, setManualCode] = useState("");
-  const [imageLoading, setImageLoading] = useState(false);
-  const [engine, setEngine] = useState<string>("");
+  const [status, setStatus] = useState<"idle" | "starting" | "scanning">("idle");
 
   useEffect(() => {
     onScanRef.current = onScan;
     onCloseRef.current = onClose;
   }, [onScan, onClose]);
 
-  const stopCamera = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+  const stopAll = useCallback(async () => {
+    if (decodeTimerRef.current) {
+      clearInterval(decodeTimerRef.current);
+      decodeTimerRef.current = null;
     }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
+    const cam = cameraRef.current;
+    cameraRef.current = null;
+    if (cam?.isScanning) {
+      try {
+        await cam.stop();
+        cam.clear();
+      } catch {
+        try {
+          cam.clear();
+        } catch {
+          /* noop */
+        }
+      }
     }
-    const video = videoRef.current;
-    if (video) video.srcObject = null;
     busyRef.current = false;
   }, []);
 
-  const emitCode = useCallback(
-    (code: string) => {
+  const onCodeFound = useCallback(
+    async (code: string) => {
       if (foundRef.current) return;
       const trimmed = code.trim();
       if (!trimmed) return;
       foundRef.current = true;
-      stopCamera();
+      await stopAll();
       onScanRef.current(trimmed);
       onCloseRef.current();
     },
-    [stopCamera]
+    [stopAll]
   );
 
-  const decodeFrame = useCallback(
-    async (source: HTMLVideoElement | HTMLCanvasElement) => {
+  const decodeVideoFrame = useCallback(
+    async (video: HTMLVideoElement, Quagga: QuaggaAPI) => {
       if (busyRef.current || foundRef.current) return;
+      if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA || !video.videoWidth) return;
+
       busyRef.current = true;
       try {
-        const native = getNativeDetector();
-        if (native) {
-          const codes = await native.detect(source);
-          if (codes[0]?.rawValue) {
-            emitCode(codes[0].rawValue);
-            return;
+        if ("BarcodeDetector" in window) {
+          try {
+            const Detector = (window as Window & {
+              BarcodeDetector: new (o: { formats: string[] }) => {
+                detect: (s: ImageBitmapSource) => Promise<Array<{ rawValue: string }>>;
+              };
+            }).BarcodeDetector;
+            const detector = new Detector({
+              formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39"],
+            });
+            const codes = await detector.detect(video);
+            if (codes[0]?.rawValue) {
+              await onCodeFound(codes[0].rawValue);
+              return;
+            }
+          } catch {
+            // continuar con Quagga
           }
         }
 
-        if (source instanceof HTMLVideoElement) {
-          if (source.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA || !source.videoWidth) return;
-          const canvas = document.createElement("canvas");
-          canvas.width = source.videoWidth;
-          canvas.height = source.videoHeight;
-          const ctx = canvas.getContext("2d");
-          if (!ctx) return;
-          ctx.drawImage(source, 0, 0);
-          const result = await createZxingReader().decodeFromImageUrl(
-            canvas.toDataURL("image/jpeg", 0.9)
-          );
-          emitCode(result.getText());
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return;
+        ctx.drawImage(video, 0, 0);
+
+        const result = await Quagga.decodeSingle({
+          src: canvas.toDataURL("image/jpeg", 0.92),
+          numOfWorkers: 0,
+          locate: true,
+          locator: { patchSize: "large", halfSample: false },
+          decoder: { readers: QUAGGA_READERS },
+        });
+
+        if (result.codeResult?.code) {
+          await onCodeFound(result.codeResult.code);
         }
       } catch {
-        // sin código en este frame
+        // frame sin lectura
       } finally {
         busyRef.current = false;
       }
     },
-    [emitCode]
-  );
-
-  const decodeFile = useCallback(
-    async (file: File) => {
-      const native = getNativeDetector();
-      if (native) {
-        const bitmap = await createImageBitmap(file);
-        try {
-          const codes = await native.detect(bitmap);
-          if (codes[0]?.rawValue) return codes[0].rawValue;
-        } finally {
-          bitmap.close();
-        }
-      }
-      const url = URL.createObjectURL(file);
-      try {
-        const result = await createZxingReader().decodeFromImageUrl(url);
-        return result.getText();
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    },
-    []
+    [onCodeFound]
   );
 
   useEffect(() => {
     if (!isOpen) {
-      stopCamera();
+      void stopAll();
       setStatus("idle");
       return;
     }
@@ -174,51 +192,54 @@ export default function BarcodeScanner({
     const start = async () => {
       setStatus("starting");
       setError(null);
-      setManualCode("");
 
       await new Promise((r) => requestAnimationFrame(r));
-      const video = videoRef.current;
-      if (cancelled || !video) return;
+      if (cancelled) return;
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
+        await stopAll();
+        const Quagga = await loadQuaggaScript();
+        if (cancelled) return;
+
+        const camera = new Html5Qrcode(SCANNER_DIV, {
+          verbose: false,
+          formatsToSupport: HTML5_FORMATS,
+          useBarCodeDetectorIfSupported: false,
         });
+        cameraRef.current = camera;
+
+        const cameras = await Html5Qrcode.getCameras();
+        if (!cameras.length) throw new Error("No hay cámara");
+
+        const cameraId = cameras[cameras.length - 1].id;
+
+        await camera.start(
+          cameraId,
+          { fps: 15, aspectRatio: 1.777778 },
+          (text) => {
+            if (!cancelled) void onCodeFound(text);
+          },
+          () => {}
+        );
 
         if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+          await stopAll();
           return;
         }
 
-        streamRef.current = stream;
-        video.srcObject = stream;
-        video.playsInline = true;
-        video.muted = true;
-        await video.play();
+        const video = document.querySelector<HTMLVideoElement>(`#${SCANNER_DIV} video`);
+        if (video) {
+          decodeTimerRef.current = setInterval(() => {
+            void decodeVideoFrame(video, Quagga);
+          }, 200);
+        }
 
-        const usingNative = getNativeDetector() !== null;
-        setEngine(usingNative ? "BarcodeDetector (nativo)" : "ZXing");
-
-        timerRef.current = setInterval(() => {
-          void decodeFrame(video);
-        }, usingNative ? 200 : 350);
-
-        if (!cancelled) setStatus("scanning");
+        setStatus("scanning");
       } catch (err) {
         if (!cancelled) {
-          const msg = err instanceof Error ? err.message : "Error";
-          setError(
-            /permission|denied|notallowed/i.test(msg)
-              ? "Permiso de cámara denegado."
-              : `No se pudo abrir la cámara: ${msg}`
-          );
-          setStatus("error");
+          setError(err instanceof Error ? err.message : "Error al iniciar escáner");
         }
-        stopCamera();
+        await stopAll();
       }
     };
 
@@ -226,40 +247,9 @@ export default function BarcodeScanner({
 
     return () => {
       cancelled = true;
-      stopCamera();
+      void stopAll();
     };
-  }, [isOpen, stopCamera, decodeFrame]);
-
-  const handleManualSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const code = manualCode.trim();
-    if (!code) return;
-    stopCamera();
-    onScan(code);
-    onClose();
-  };
-
-  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setImageLoading(true);
-    setError(null);
-    try {
-      const code = await decodeFile(file);
-      emitCode(code);
-    } catch {
-      setError("No se detectó código en la imagen.");
-      setStatus("error");
-    } finally {
-      setImageLoading(false);
-      e.target.value = "";
-    }
-  };
-
-  const handleClose = () => {
-    stopCamera();
-    onClose();
-  };
+  }, [isOpen, stopAll, decodeVideoFrame, onCodeFound]);
 
   return (
     <div
@@ -270,59 +260,38 @@ export default function BarcodeScanner({
     >
       <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-          <div>
-            <h2 className="text-lg font-semibold text-slate-900">Escanear código de barras</h2>
-            <p className="text-sm text-slate-500">Coloca el código en horizontal frente a la cámara</p>
-          </div>
-          <button type="button" onClick={handleClose} className="rounded-lg p-2 text-slate-400 hover:bg-slate-100" aria-label="Cerrar">
-            ✕
+          <h2 className="text-lg font-semibold text-slate-900">Escanear código de barras</h2>
+          <button
+            type="button"
+            onClick={() => {
+              void stopAll();
+              onClose();
+            }}
+            className="rounded-lg px-3 py-1 text-slate-500 hover:bg-slate-100"
+          >
+            Cerrar
           </button>
         </div>
 
         <div className="p-5">
-          {status === "starting" && <p className="mb-3 text-sm text-slate-600">Abriendo cámara...</p>}
+          {status === "starting" && (
+            <p className="mb-3 text-sm text-slate-600">Iniciando cámara...</p>
+          )}
           {status === "scanning" && (
-            <p className="mb-3 text-sm text-green-700">
-              Cámara activa ({engine}) — acerca el código despacio
+            <p className="mb-3 text-sm font-medium text-green-700">
+              Escaneando — coloca el código en horizontal frente a la cámara
             </p>
           )}
-          {error && <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+          {error && (
+            <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+              {error}
+            </p>
+          )}
 
-          <div className="relative aspect-video overflow-hidden rounded-lg border border-slate-300 bg-black">
-            <video ref={videoRef} className="h-full w-full object-cover" playsInline muted autoPlay />
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <div className="h-20 w-[88%] rounded border-2 border-green-400" />
-            </div>
-          </div>
-
-          <p className="mt-2 text-xs text-slate-500">
-            Usa Chrome o Edge. Centra el código en el recuadro verde, con buena luz.
-          </p>
-
-          <form onSubmit={handleManualSubmit} className="mt-4 space-y-3 border-t border-slate-200 pt-4">
-            <label className="btn-secondary cursor-pointer justify-center">
-              <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleImageUpload} disabled={imageLoading} />
-              {imageLoading ? "Analizando foto..." : "Subir foto del código"}
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                className="input font-mono"
-                placeholder="Código manual"
-                value={manualCode}
-                onChange={(e) => setManualCode(e.target.value)}
-              />
-              <button type="submit" className="btn-primary shrink-0" disabled={!manualCode.trim()}>
-                Usar
-              </button>
-            </div>
-          </form>
-        </div>
-
-        <div className="flex justify-end border-t border-slate-200 px-5 py-4">
-          <button type="button" onClick={handleClose} className="btn-secondary">
-            Cancelar
-          </button>
+          <div
+            id={SCANNER_DIV}
+            className="scanner-live overflow-hidden rounded-lg border-2 border-slate-300 bg-black"
+          />
         </div>
       </div>
     </div>
