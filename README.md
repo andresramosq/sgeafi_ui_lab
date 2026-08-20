@@ -7,7 +7,7 @@ Interfaz de usuario completa para probar un backend de inventario (estilo Odoo /
 - **CRUD completo**: crear, leer, actualizar, desactivar y eliminar productos
 - **Tabla con filtros**: búsqueda por código, nombre o descripción; filtro por estado
 - **Formulario modal** con todos los campos estándar de producto físico
-- **Escáner de códigos de barras** con `@zxing/browser` (cámara web + foto)
+- **Escáner de códigos de barras** con `html5-qrcode` (cámara web + foto)
 - **Capa API preparada** con funciones `fetch` comentadas para conectar tu backend
 
 ## Campos del producto
@@ -100,7 +100,7 @@ src/
 │   ├── page.tsx            # Página de inventario
 │   └── globals.css         # Estilos globales (Tailwind)
 ├── components/
-│   ├── BarcodeScanner.tsx  # Escáner con ZXing (cámara + imagen)
+│   ├── BarcodeScanner.tsx  # Escáner con html5-qrcode
 │   ├── ProductFilters.tsx  # Filtros de búsqueda
 │   ├── ProductForm.tsx     # Formulario crear/editar
 │   └── ProductTable.tsx    # Tabla de productos
@@ -119,7 +119,7 @@ src/
 - **Next.js 14** (App Router)
 - **TypeScript**
 - **Tailwind CSS**
-- **@zxing/browser** (escáner de códigos de barras 1D)
+- **html5-qrcode** (escáner de códigos de barras)
 
 ## Scripts
 

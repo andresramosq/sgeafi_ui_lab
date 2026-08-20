@@ -36,4 +36,11 @@
   .label {
     @apply mb-1 block text-sm font-medium text-slate-700;
   }
+
+  .scanner-container video {
+    display: block !important;
+    width: 100% !important;
+    max-height: 360px;
+    object-fit: cover;
+  }
 }
